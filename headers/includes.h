@@ -19,6 +19,9 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <errno.h>
+#include <sys/random.h>
 
 /* Standard Debug Macro mapping to standard printf when DEBUG is defined */
 #ifdef DEBUG

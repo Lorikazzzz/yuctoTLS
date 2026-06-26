@@ -1,6 +1,42 @@
 #include "headers/chacha20.h"
 #include "headers/includes.h"
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+#define CHACHA_SSE2 1
+
+#define ROL32V(x,n) _mm_or_si128(_mm_slli_epi32(x,(n)), _mm_srli_epi32(x,32-(n)))
+#define QR(v,a,b,c,d) \
+    v[a]=_mm_add_epi32(v[a],v[b]); v[d]=_mm_xor_si128(v[d],v[a]); v[d]=ROL32V(v[d],16); \
+    v[c]=_mm_add_epi32(v[c],v[d]); v[b]=_mm_xor_si128(v[b],v[c]); v[b]=ROL32V(v[b],12); \
+    v[a]=_mm_add_epi32(v[a],v[b]); v[d]=_mm_xor_si128(v[d],v[a]); v[d]=ROL32V(v[d],8);  \
+    v[c]=_mm_add_epi32(v[c],v[d]); v[b]=_mm_xor_si128(v[b],v[c]); v[b]=ROL32V(v[b],7);
+
+/* Produce 4 ChaCha20 keystream blocks (256 bytes) for counters c..c+3. */
+__attribute__((target("sse2")))
+static void chacha20_4block(const uint32_t s[16], uint8_t out[256]) {
+    __m128i v[16], o[16];
+    for (int i = 0; i < 16; i++) v[i] = _mm_set1_epi32((int)s[i]);
+    v[12] = _mm_add_epi32(v[12], _mm_set_epi32(3, 2, 1, 0));   /* counters c..c+3 */
+    for (int i = 0; i < 16; i++) o[i] = v[i];
+    for (int r = 0; r < 10; r++) {
+        QR(v,0,4,8,12); QR(v,1,5,9,13); QR(v,2,6,10,14); QR(v,3,7,11,15);
+        QR(v,0,5,10,15); QR(v,1,6,11,12); QR(v,2,7,8,13); QR(v,3,4,9,14);
+    }
+    for (int i = 0; i < 16; i++) v[i] = _mm_add_epi32(v[i], o[i]);
+    uint32_t t[16][4];
+    for (int i = 0; i < 16; i++) _mm_storeu_si128((__m128i*)t[i], v[i]);
+    for (int b = 0; b < 4; b++)
+        for (int i = 0; i < 16; i++) {
+            uint32_t w = t[i][b];   /* lane b of word i = block b's word i */
+            out[b*64+i*4+0]=(uint8_t)w;      out[b*64+i*4+1]=(uint8_t)(w>>8);
+            out[b*64+i*4+2]=(uint8_t)(w>>16);out[b*64+i*4+3]=(uint8_t)(w>>24);
+        }
+}
+#undef QR
+#undef ROL32V
+#endif
+
 static inline void u32t8le(uint32_t v, uint8_t *p) {
     p[0] = v & 0xff;
     p[1] = (v >> 8) & 0xff;
@@ -92,14 +128,21 @@ void chacha20_xor(uint8_t *key, uint32_t counter, uint8_t *nonce, char *in, char
 
     chacha20_init_state(s, key, counter, nonce);
 
-    for (i = 0; i < inlen; i += 64) {
+    i = 0;
+#ifdef CHACHA_SSE2
+    /* 4-way SIMD: 256 bytes per iteration */
+    uint8_t ks[256];
+    for (; i + 256 <= inlen; i += 256) {
+        chacha20_4block(s, ks);
+        s[12] += 4;
+        for (int k = 0; k < 256; k++) out[i + k] = in[i + k] ^ ks[k];
+    }
+#endif
+    for (; i < inlen; i += 64) {
         chacha20_block(s, block, 20);
         s[12]++;
-
         for (j = i; j < i + 64; j++) {
-            if (j >= inlen) {
-                break;
-            }
+            if (j >= inlen) break;
             out[j] = in[j] ^ block[j - i];
         }
     }

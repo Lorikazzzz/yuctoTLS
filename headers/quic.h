@@ -62,11 +62,12 @@ typedef struct {
     int original_dcid_len;
     uint8_t priv_key[32];
     uint8_t pub_key[32];
-    uint8_t handshake_secret[32];
-    uint8_t c_hs_secret[32];
-    uint8_t master_secret[32];
-    uint8_t s_app_key[16], s_app_iv[12], s_app_hp[16];
-    uint8_t c_app_key[16], c_app_iv[12], c_app_hp[16];
+    uint8_t handshake_secret[48];
+    uint8_t c_hs_secret[48];
+    uint8_t master_secret[48];
+    uint16_t cipher_suite;
+    uint8_t s_app_key[32], s_app_iv[12], s_app_hp[32];
+    uint8_t c_app_key[32], c_app_iv[12], c_app_hp[32];
     uint64_t s_app_pn_next;
     uint64_t c_app_pn;       /* next client 1-RTT packet number to send */
     uint64_t s_initial_pn_max;
@@ -98,7 +99,7 @@ typedef struct {
     uint64_t rttvar;
     
     // Handshake keys persistence
-    uint8_t c_hs_key[16], c_hs_iv[12], c_hs_hp[16];
+    uint8_t c_hs_key[32], c_hs_iv[12], c_hs_hp[32];
     
     // Received packet range tracking
     struct {
@@ -136,7 +137,7 @@ void quic_derive_server_initial_secrets(const uint8_t *cid, int cid_len, uint8_t
 int quic_decrypt_initial(quic_conn *conn, uint8_t *pkt, int len, uint8_t *out, int *consumed_len);
 int quic_decrypt_handshake(quic_conn *conn, uint8_t *pkt, int len, const uint8_t *s_key, const uint8_t *s_iv, const uint8_t *s_hp, uint8_t *out, int *consumed_len);
 int quic_decrypt_1rtt(quic_conn *conn, uint8_t *pkt, int len, const uint8_t *s_key, const uint8_t *s_iv, const uint8_t *s_hp, uint8_t *out, int *consumed_len);
-int quic_parse_server_hello(const uint8_t *sh, int len, uint8_t *server_pub_key);
+int quic_parse_server_hello(const uint8_t *sh, int len, uint8_t *server_pub_key, uint16_t *cipher_out);
 void quic_derive_handshake_secrets(quic_conn *conn, const uint8_t *shared_secret, const uint8_t *transcript_hash, uint8_t *c_key, uint8_t *c_iv, uint8_t *c_hp, uint8_t *s_key, uint8_t *s_iv, uint8_t *s_hp);
 void quic_derive_application_secrets(quic_conn *conn, const uint8_t *transcript_hash);
 void quic_send_finished(quic_conn *conn, const uint8_t *transcript_hash, const uint8_t *c_hs_key, const uint8_t *c_hs_iv, const uint8_t *c_hs_hp);
