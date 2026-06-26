@@ -1,6 +1,27 @@
-Basically an Http3, http2 and http 1.1 library with no dependencies
+# yoctoTLS
 
-ITS MADE WITH AI SO YOU CAN JUST FORK IT AND FIX THE THINGS THATS MISSING OR BROKEN
+A dependency-free HTTP/3 (QUIC), HTTP/2 and HTTP/1.1 client library in C, with a
+Chrome-accurate TLS/QUIC fingerprint, post-quantum key exchange (X25519MLKEM768),
+and hardware-accelerated bulk crypto.
+
+> Originally AI-generated. This fork fixes the security/correctness bugs, swaps the
+> broken post-quantum code for the audited PQClean reference, adds TLS 1.3 session
+> resumption, and hardware-accelerates AES-GCM / ChaCha20. See
+> [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
+
+### Features
+- HTTP/3 over QUIC, HTTP/2 and HTTP/1.1 with transparent fallback
+- TLS 1.3 + TLS 1.2, Chrome-accurate JA3/JA4 fingerprint (incl. session resumption)
+- X25519MLKEM768 post-quantum hybrid key exchange (FIPS 203 / PQClean)
+- AES-128/256-GCM at multi-Gbit/s (AES-NI + PCLMULQDQ), 4-way SIMD ChaCha20
+- No external dependencies — builds with `make`
+
+### Build
+```sh
+make            # static + shared library
+make test       # build the example clients (test_h2, test_quic)
+./test_h2 <ip> <host> <path>
+```
 
 ---
 

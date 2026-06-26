@@ -20,8 +20,39 @@ static const uint8_t sha256_empty[32] = {
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
     0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55
 };
+static const uint8_t sha384_empty[48] = {
+    0x38, 0xb0, 0x60, 0xa7, 0x51, 0xac, 0x96, 0x38,
+    0x4c, 0xd9, 0x32, 0x7e, 0xb1, 0xb1, 0xe3, 0x6a,
+    0x21, 0xfd, 0xb7, 0x11, 0x14, 0xbe, 0x07, 0x43,
+    0x4c, 0x0c, 0xc7, 0xbf, 0x63, 0xf6, 0xe1, 0xda,
+    0x27, 0x4e, 0xde, 0xbf, 0xe7, 0x6f, 0x65, 0xfb,
+    0xd5, 0x1a, 0xd2, 0xf1, 0x48, 0x98, 0xb9, 0x5b
+};
 
 static void quic_parse_frames(quic_conn *conn, uint8_t *payload, int len, int epoch);
+
+static void quic_hkdf_expand_label_384(uint8_t *out, const uint8_t *secret, const char *label, uint16_t out_len) {
+    uint8_t hkdf_label[96];
+    int label_len = strlen(label), off = 0;
+    hkdf_label[off++] = out_len >> 8; hkdf_label[off++] = out_len & 0xFF;
+    hkdf_label[off++] = (uint8_t)(label_len + 6);
+    memcpy(hkdf_label + off, "tls13 ", 6); off += 6;
+    memcpy(hkdf_label + off, label, label_len); off += label_len;
+    hkdf_label[off++] = 0;
+    hkdf_sha384_expand(secret, hkdf_label, off, out, out_len);
+}
+
+static void quic_hkdf_derive_secret_384(uint8_t *out, const uint8_t *secret, const char *label, const uint8_t *transcript_hash) {
+    uint8_t hkdf_label[96];
+    int label_len = strlen(label), off = 0;
+    hkdf_label[off++] = 0x00; hkdf_label[off++] = 0x30;
+    hkdf_label[off++] = (uint8_t)(label_len + 6);
+    memcpy(hkdf_label + off, "tls13 ", 6); off += 6;
+    memcpy(hkdf_label + off, label, label_len); off += label_len;
+    hkdf_label[off++] = 48;
+    memcpy(hkdf_label + off, transcript_hash, 48); off += 48;
+    hkdf_sha384_expand(secret, hkdf_label, off, out, 48);
+}
 
 static void quic_hkdf_expand_label(uint8_t *out, const uint8_t *secret, const char *label, uint16_t out_len) {
     uint8_t hkdf_label[64];
@@ -80,34 +111,65 @@ void quic_derive_client_initial_secrets(const uint8_t *cid, int cid_len, uint8_t
 void quic_derive_server_initial_secrets(const uint8_t *cid, int cid_len, uint8_t *key, uint8_t *iv, uint8_t *hp) { quic_derive_initial_secrets(cid, cid_len, "server in", key, iv, hp); }
 
 void quic_derive_handshake_secrets(quic_conn *conn, const uint8_t *shared_secret, const uint8_t *transcript_hash, uint8_t *c_key, uint8_t *c_iv, uint8_t *c_hp, uint8_t *s_key, uint8_t *s_iv, uint8_t *s_hp) {
-    uint8_t derived_secret[32], early_secret[32], zero[32] = {0};
-    hkdf_sha256_extract(zero, 32, zero, 32, early_secret);
-    quic_hkdf_derive_secret(derived_secret, early_secret, "derived", sha256_empty);
-    hkdf_sha256_extract(derived_secret, 32, shared_secret, 32, conn->handshake_secret);
-    quic_hkdf_derive_secret(conn->c_hs_secret, conn->handshake_secret, "c hs traffic", transcript_hash);
-    uint8_t s_hs_secret[32];
-    quic_hkdf_derive_secret(s_hs_secret, conn->handshake_secret, "s hs traffic", transcript_hash);
-    quic_hkdf_expand_label(c_key, conn->c_hs_secret, "quic key", 16);
-    quic_hkdf_expand_label(c_iv, conn->c_hs_secret, "quic iv", 12);
-    quic_hkdf_expand_label(c_hp, conn->c_hs_secret, "quic hp", 16);
-    quic_hkdf_expand_label(s_key, s_hs_secret, "quic key", 16);
-    quic_hkdf_expand_label(s_iv, s_hs_secret, "quic iv", 12);
-    quic_hkdf_expand_label(s_hp, s_hs_secret, "quic hp", 16);
+    if (conn->cipher_suite == 0x1302) {
+        uint8_t derived_secret[48], early_secret[48], zero[48] = {0};
+        uint8_t s_hs_secret[48];
+        hkdf_sha384_extract(zero, 48, zero, 48, early_secret);
+        quic_hkdf_derive_secret_384(derived_secret, early_secret, "derived", sha384_empty);
+        hkdf_sha384_extract(derived_secret, 48, shared_secret, 32, conn->handshake_secret);
+        quic_hkdf_derive_secret_384(conn->c_hs_secret, conn->handshake_secret, "c hs traffic", transcript_hash);
+        quic_hkdf_derive_secret_384(s_hs_secret, conn->handshake_secret, "s hs traffic", transcript_hash);
+        quic_hkdf_expand_label_384(c_key, conn->c_hs_secret, "quic key", 32);
+        quic_hkdf_expand_label_384(c_iv,  conn->c_hs_secret, "quic iv",  12);
+        quic_hkdf_expand_label_384(c_hp,  conn->c_hs_secret, "quic hp",  32);
+        quic_hkdf_expand_label_384(s_key, s_hs_secret,       "quic key", 32);
+        quic_hkdf_expand_label_384(s_iv,  s_hs_secret,       "quic iv",  12);
+        quic_hkdf_expand_label_384(s_hp,  s_hs_secret,       "quic hp",  32);
+    } else {
+        uint8_t derived_secret[32], early_secret[32], zero[32] = {0};
+        uint8_t s_hs_secret[32];
+        hkdf_sha256_extract(zero, 32, zero, 32, early_secret);
+        quic_hkdf_derive_secret(derived_secret, early_secret, "derived", sha256_empty);
+        hkdf_sha256_extract(derived_secret, 32, shared_secret, 32, conn->handshake_secret);
+        quic_hkdf_derive_secret(conn->c_hs_secret, conn->handshake_secret, "c hs traffic", transcript_hash);
+        quic_hkdf_derive_secret(s_hs_secret, conn->handshake_secret, "s hs traffic", transcript_hash);
+        quic_hkdf_expand_label(c_key, conn->c_hs_secret, "quic key", 16);
+        quic_hkdf_expand_label(c_iv,  conn->c_hs_secret, "quic iv",  12);
+        quic_hkdf_expand_label(c_hp,  conn->c_hs_secret, "quic hp",  16);
+        quic_hkdf_expand_label(s_key, s_hs_secret,       "quic key", 16);
+        quic_hkdf_expand_label(s_iv,  s_hs_secret,       "quic iv",  12);
+        quic_hkdf_expand_label(s_hp,  s_hs_secret,       "quic hp",  16);
+    }
 }
 
 void quic_derive_application_secrets(quic_conn *conn, const uint8_t *transcript_hash) {
-    uint8_t derived_secret[32], zero[32] = {0};
-    quic_hkdf_derive_secret(derived_secret, conn->handshake_secret, "derived", sha256_empty);
-    hkdf_sha256_extract(derived_secret, 32, zero, 32, conn->master_secret);
-    uint8_t c_secret[32], s_secret[32];
-    quic_hkdf_derive_secret(c_secret, conn->master_secret, "c ap traffic", transcript_hash);
-    quic_hkdf_derive_secret(s_secret, conn->master_secret, "s ap traffic", transcript_hash);
-    quic_hkdf_expand_label(conn->c_app_key, c_secret, "quic key", 16);
-    quic_hkdf_expand_label(conn->c_app_iv,  c_secret, "quic iv",  12);
-    quic_hkdf_expand_label(conn->c_app_hp,  c_secret, "quic hp",  16);
-    quic_hkdf_expand_label(conn->s_app_key, s_secret, "quic key", 16);
-    quic_hkdf_expand_label(conn->s_app_iv,  s_secret, "quic iv",  12);
-    quic_hkdf_expand_label(conn->s_app_hp,  s_secret, "quic hp",  16);
+    if (conn->cipher_suite == 0x1302) {
+        uint8_t derived_secret[48], zero[48] = {0};
+        uint8_t c_secret[48], s_secret[48];
+        quic_hkdf_derive_secret_384(derived_secret, conn->handshake_secret, "derived", sha384_empty);
+        hkdf_sha384_extract(derived_secret, 48, zero, 48, conn->master_secret);
+        quic_hkdf_derive_secret_384(c_secret, conn->master_secret, "c ap traffic", transcript_hash);
+        quic_hkdf_derive_secret_384(s_secret, conn->master_secret, "s ap traffic", transcript_hash);
+        quic_hkdf_expand_label_384(conn->c_app_key, c_secret, "quic key", 32);
+        quic_hkdf_expand_label_384(conn->c_app_iv,  c_secret, "quic iv",  12);
+        quic_hkdf_expand_label_384(conn->c_app_hp,  c_secret, "quic hp",  32);
+        quic_hkdf_expand_label_384(conn->s_app_key, s_secret, "quic key", 32);
+        quic_hkdf_expand_label_384(conn->s_app_iv,  s_secret, "quic iv",  12);
+        quic_hkdf_expand_label_384(conn->s_app_hp,  s_secret, "quic hp",  32);
+    } else {
+        uint8_t derived_secret[32], zero[32] = {0};
+        uint8_t c_secret[32], s_secret[32];
+        quic_hkdf_derive_secret(derived_secret, conn->handshake_secret, "derived", sha256_empty);
+        hkdf_sha256_extract(derived_secret, 32, zero, 32, conn->master_secret);
+        quic_hkdf_derive_secret(c_secret, conn->master_secret, "c ap traffic", transcript_hash);
+        quic_hkdf_derive_secret(s_secret, conn->master_secret, "s ap traffic", transcript_hash);
+        quic_hkdf_expand_label(conn->c_app_key, c_secret, "quic key", 16);
+        quic_hkdf_expand_label(conn->c_app_iv,  c_secret, "quic iv",  12);
+        quic_hkdf_expand_label(conn->c_app_hp,  c_secret, "quic hp",  16);
+        quic_hkdf_expand_label(conn->s_app_key, s_secret, "quic key", 16);
+        quic_hkdf_expand_label(conn->s_app_iv,  s_secret, "quic iv",  12);
+        quic_hkdf_expand_label(conn->s_app_hp,  s_secret, "quic hp",  16);
+    }
 }
 
 quic_conn *quic_connect(struct sockaddr_in *addr, const char *host) {
@@ -116,13 +178,13 @@ quic_conn *quic_connect(struct sockaddr_in *addr, const char *host) {
     if (!conn) return NULL;
     memset(conn, 0, sizeof(quic_conn));
     conn->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in local; memset(&local, 0, sizeof(local));
-    local.sin_family = AF_INET; local.sin_addr.s_addr = 0; local.sin_port = 0;
-    bind(conn->fd, (struct sockaddr *)&local, sizeof(local)); /* IPPROTO_UDP, 0=auto */
     if (conn->fd < 0) {
-        printf("[quic] socket failed (fd=%d)\n", conn->fd);
+        printf("[quic] socket failed\n");
         free(conn); return NULL;
     }
+    struct sockaddr_in local; memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET; local.sin_addr.s_addr = 0; local.sin_port = 0;
+    bind(conn->fd, (struct sockaddr *)&local, sizeof(local));
     /* 500ms receive timeout */
     struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 500000;
     setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -248,14 +310,22 @@ int quic_decrypt_handshake(quic_conn *conn, uint8_t *pkt, int len, const uint8_t
     int l = 0;
     int plen = (int)quic_parse_varint(pkt + off, len - off, &l); off += l;
     if (consumed_len) *consumed_len = off + plen;
-    uint8_t saved_first = pkt[0];                              // save MASKED byte BEFORE unmasking
-    uint8_t mask[16]; aes_128_ecb_encrypt(s_hp, pkt + off + 4, mask);
+    uint8_t saved_first = pkt[0];
+    uint8_t mask[16];
+    if (conn->cipher_suite == 0x1302)
+        aes_256_ecb_encrypt(s_hp, pkt + off + 4, mask);
+    else
+        aes_128_ecb_encrypt(s_hp, pkt + off + 4, mask);
     pkt[0] ^= (mask[0] & 0x0F); int pn_len = (pkt[0] & 0x03) + 1; uint32_t pn = 0;
     uint8_t pn_bytes[4];
     for(int i=0; i<pn_len; i++) { pn_bytes[i] = pkt[off+i]; pkt[off+i] ^= mask[1+i]; pn = (pn << 8) | pkt[off+i]; }
     uint8_t nonce[12]; memcpy(nonce, s_iv, 12); for (int i = 0; i < 4; i++) nonce[11-i] ^= (uint8_t)(pn >> (i*8));
     if (pn > conn->s_hs_pn_max) conn->s_hs_pn_max = pn;
-    int ret = aes_128_gcm_decrypt(s_key, nonce, pkt, off + pn_len, pkt + off + pn_len, plen - pn_len - 16, out, pkt + off + plen - 16);
+    int ret;
+    if (conn->cipher_suite == 0x1302)
+        ret = aes_256_gcm_decrypt(s_key, nonce, pkt, off + pn_len, pkt + off + pn_len, plen - pn_len - 16, out, pkt + off + plen - 16);
+    else
+        ret = aes_128_gcm_decrypt(s_key, nonce, pkt, off + pn_len, pkt + off + pn_len, plen - pn_len - 16, out, pkt + off + plen - 16);
     if (ret >= 0) {
         printf("[quic-demo] Decrypted Handshake (%d bytes)\n", ret);
         quic_add_received_pn(conn, 2, pn);
@@ -437,13 +507,21 @@ static void quic_parse_frames(quic_conn *conn, uint8_t *payload, int len, int ep
 
 int quic_decrypt_1rtt(quic_conn *conn, uint8_t *pkt, int len, const uint8_t *s_key, const uint8_t *s_iv, const uint8_t *s_hp, uint8_t *out, int *consumed_len) {
     int dcid_len = conn->scid_len, pn_pos = 1 + dcid_len;
-    uint8_t mask[16]; aes_128_ecb_encrypt(s_hp, pkt + pn_pos + 4, mask);
+    uint8_t mask[16];
+    if (conn->cipher_suite == 0x1302)
+        aes_256_ecb_encrypt(s_hp, pkt + pn_pos + 4, mask);
+    else
+        aes_128_ecb_encrypt(s_hp, pkt + pn_pos + 4, mask);
     pkt[0] ^= (mask[0] & 0x1F); int pn_len = (pkt[0] & 0x03) + 1; uint32_t pn_tr = 0;
     for (int i = 0; i < pn_len; i++) { pkt[pn_pos+i] ^= mask[1+i]; pn_tr = (pn_tr << 8) | pkt[pn_pos+i]; }
     uint64_t exp = conn->s_app_pn_next, win = 1ULL << (pn_len * 8), msk = win - 1, pn = (exp & ~msk) | pn_tr;
     if (pn + win / 2 <= exp) pn += win; else if (pn > exp + win / 2 && pn >= win) pn -= win;
     uint8_t nonce[12]; memcpy(nonce, s_iv, 12); for (int i = 0; i < 8; i++) nonce[11-i] ^= (uint8_t)(pn >> (i*8));
-    int ret = aes_128_gcm_decrypt(s_key, nonce, pkt, pn_pos + pn_len, pkt + pn_pos + pn_len, len - pn_pos - pn_len - 16, out, pkt + len - 16);
+    int ret;
+    if (conn->cipher_suite == 0x1302)
+        ret = aes_256_gcm_decrypt(s_key, nonce, pkt, pn_pos + pn_len, pkt + pn_pos + pn_len, len - pn_pos - pn_len - 16, out, pkt + len - 16);
+    else
+        ret = aes_128_gcm_decrypt(s_key, nonce, pkt, pn_pos + pn_len, pkt + pn_pos + pn_len, len - pn_pos - pn_len - 16, out, pkt + len - 16);
     if (consumed_len) *consumed_len = len;
     if (ret >= 0) {
         conn->s_app_pn_next = pn + 1;
@@ -465,19 +543,19 @@ int quic_parse_retry(uint8_t *pkt, int len, uint8_t *new_dcid, int *new_dcid_len
     return 0;
 }
 
-int quic_parse_server_hello(const uint8_t *sh, int len, uint8_t *server_pub_key) {
+int quic_parse_server_hello(const uint8_t *sh, int len, uint8_t *server_pub_key, uint16_t *cipher_out) {
     if (len < 40) { printf("[quic-err] SH too short (%d)\n", len); return 0; }
     if (sh[0] != 0x02) { printf("[quic-err] SH wrong type (0x%02x)\n", sh[0]); return 0; }
-    // sh[38] = session_id_length; cipher suite is right after session_id
     int sid_len = sh[38];
     int cipher_off = 38 + 1 + sid_len;
     if (cipher_off + 2 > len) { printf("[quic-err] SH too short for cipher\n"); return 0; }
     uint16_t cipher = (sh[cipher_off] << 8) | sh[cipher_off + 1];
     printf("[quic-demo] Server selected cipher: 0x%04x\n", cipher);
-    if (cipher != 0x1301) {
-        printf("[quic-err] Unsupported cipher 0x%04x (need TLS_AES_128_GCM_SHA256)\n", cipher);
+    if (cipher != 0x1301 && cipher != 0x1302) {
+        printf("[quic-err] Unsupported cipher 0x%04x (need 0x1301 or 0x1302)\n", cipher);
         return 0;
     }
+    if (cipher_out) *cipher_out = cipher;
     int off = cipher_off + 2 + 1; // skip Cipher(2) + Compression(1)
     if (off + 2 > len) { printf("[quic-err] SH too short for ext len\n"); return 0; }
     int e_len = (sh[off]<<8)|sh[off+1]; off += 2; int end = off + e_len;
@@ -515,10 +593,16 @@ void quic_send_handshake_raw(quic_conn *conn, const uint8_t *payload, int plen, 
     uint8_t nonce[12]; memcpy(nonce, c_hs_iv, 12);
     for (int i = 0; i < 4; i++) nonce[11 - i] ^= (uint8_t)(cpn >> (i * 8));
     uint8_t tag[16];
-    aes_128_gcm_encrypt(c_hs_key, nonce, pkt, off, payload, plen, pkt + off, tag);
+    if (conn->cipher_suite == 0x1302)
+        aes_256_gcm_encrypt(c_hs_key, nonce, pkt, off, payload, plen, pkt + off, tag);
+    else
+        aes_128_gcm_encrypt(c_hs_key, nonce, pkt, off, payload, plen, pkt + off, tag);
     memcpy(pkt + off + plen, tag, 16);
-    // Header protection: sample starts 4 bytes after start of PN
-    uint8_t mask[16]; aes_128_ecb_encrypt(c_hs_hp, pkt + pn_pos + 4, mask);
+    uint8_t mask[16];
+    if (conn->cipher_suite == 0x1302)
+        aes_256_ecb_encrypt(c_hs_hp, pkt + pn_pos + 4, mask);
+    else
+        aes_128_ecb_encrypt(c_hs_hp, pkt + pn_pos + 4, mask);
     pkt[0] ^= (mask[0] & 0x0F);
     pkt[pn_pos]   ^= mask[1]; pkt[pn_pos+1] ^= mask[2];
     pkt[pn_pos+2] ^= mask[3]; pkt[pn_pos+3] ^= mask[4];
@@ -529,26 +613,34 @@ void quic_send_handshake_raw(quic_conn *conn, const uint8_t *payload, int plen, 
 }
 
 void quic_send_finished(quic_conn *conn, const uint8_t *transcript_hash, const uint8_t *c_hs_key, const uint8_t *c_hs_iv, const uint8_t *c_hs_hp) {
-    memcpy(conn->c_hs_key, c_hs_key, 16);
-    memcpy(conn->c_hs_iv, c_hs_iv, 12);
-    memcpy(conn->c_hs_hp, c_hs_hp, 16);
+    int key_len  = (conn->cipher_suite == 0x1302) ? 32 : 16;
+    int hash_len = (conn->cipher_suite == 0x1302) ? 48 : 32;
+    memcpy(conn->c_hs_key, c_hs_key, key_len);
+    memcpy(conn->c_hs_iv,  c_hs_iv,  12);
+    memcpy(conn->c_hs_hp,  c_hs_hp,  key_len);
 
-    uint8_t f_key[32], v_data[32];
-    quic_hkdf_expand_label(f_key, conn->c_hs_secret, "finished", 32);
-    hmac_sha256(f_key, 32, transcript_hash, 32, v_data);
+    uint8_t f_key[48], v_data[48];
+    if (conn->cipher_suite == 0x1302) {
+        quic_hkdf_expand_label_384(f_key, conn->c_hs_secret, "finished", 48);
+        hmac_sha384(f_key, 48, transcript_hash, 48, v_data);
+    } else {
+        quic_hkdf_expand_label(f_key, conn->c_hs_secret, "finished", 32);
+        hmac_sha256(f_key, 32, transcript_hash, 32, v_data);
+    }
 
-    uint8_t hs_msg[36];
-    hs_msg[0] = 0x14; hs_msg[1] = 0; hs_msg[2] = 0; hs_msg[3] = 32;
-    memcpy(hs_msg + 4, v_data, 32);
+    uint8_t hs_msg[52];
+    hs_msg[0] = 0x14; hs_msg[1] = 0; hs_msg[2] = 0; hs_msg[3] = (uint8_t)hash_len;
+    memcpy(hs_msg + 4, v_data, hash_len);
+    int hs_msg_len = 4 + hash_len;
 
-    uint8_t payload[128]; int plen = 0;
+    uint8_t payload[256]; int plen = 0;
     int ack_len = quic_build_ack_frame(conn, 2, payload, sizeof(payload));
     plen += ack_len;
 
-    payload[plen++] = 0x06;                           // CRYPTO frame type
-    plen += put_varint(payload + plen, 0);            // offset = 0
-    plen += put_varint(payload + plen, 36);           // length = 36
-    memcpy(payload + plen, hs_msg, 36); plen += 36;  // TLS Finished message
+    payload[plen++] = 0x06;
+    plen += put_varint(payload + plen, 0);
+    plen += put_varint(payload + plen, hs_msg_len);
+    memcpy(payload + plen, hs_msg, hs_msg_len); plen += hs_msg_len;
 
     quic_send_handshake_raw(conn, payload, plen, c_hs_key, c_hs_iv, c_hs_hp);
 }
@@ -564,10 +656,16 @@ void quic_send_1rtt(quic_conn *conn, const uint8_t *payload, int plen) {
     uint8_t nonce[12]; memcpy(nonce, conn->c_app_iv, 12);
     for (int i = 0; i < 8; i++) nonce[11 - i] ^= (uint8_t)(conn->c_app_pn >> (i * 8));
     uint8_t tag[16];
-    aes_128_gcm_encrypt(conn->c_app_key, nonce, pkt, off, payload, plen, pkt + off, tag);
+    if (conn->cipher_suite == 0x1302)
+        aes_256_gcm_encrypt(conn->c_app_key, nonce, pkt, off, payload, plen, pkt + off, tag);
+    else
+        aes_128_gcm_encrypt(conn->c_app_key, nonce, pkt, off, payload, plen, pkt + off, tag);
     memcpy(pkt + off + plen, tag, 16);
-    // HP: sample 16 bytes starting 4 bytes after PN start
-    uint8_t mask[16]; aes_128_ecb_encrypt(conn->c_app_hp, pkt + pn_pos + 4, mask);
+    uint8_t mask[16];
+    if (conn->cipher_suite == 0x1302)
+        aes_256_ecb_encrypt(conn->c_app_hp, pkt + pn_pos + 4, mask);
+    else
+        aes_128_ecb_encrypt(conn->c_app_hp, pkt + pn_pos + 4, mask);
     pkt[0]       ^= (mask[0] & 0x1F);
     pkt[pn_pos]   ^= mask[1]; pkt[pn_pos+1] ^= mask[2];
     pkt[pn_pos+2] ^= mask[3]; pkt[pn_pos+3] ^= mask[4];

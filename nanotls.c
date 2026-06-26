@@ -11,6 +11,85 @@ static __thread int current_proto_tls13 = 1;
 static __thread int current_proto_tls12 = 1;
 static __thread int current_proto_quic = 1;
 
+/* ── TLS 1.3 session-ticket cache (per host) for PSK resumption ─────────── */
+#define TLS_TICKET_CACHE_SIZE 16
+static tls_session_ticket g_ticket_cache[TLS_TICKET_CACHE_SIZE];
+
+static uint64_t now_ms(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL;
+}
+
+static tls_session_ticket *ticket_find(const char *host) {
+    for (int i = 0; i < TLS_TICKET_CACHE_SIZE; i++)
+        if (g_ticket_cache[i].valid && strcmp(g_ticket_cache[i].host, host) == 0)
+            return &g_ticket_cache[i];
+    return NULL;
+}
+
+static tls_session_ticket *ticket_slot(const char *host) {
+    tls_session_ticket *t = ticket_find(host);
+    if (t) return t;
+    for (int i = 0; i < TLS_TICKET_CACHE_SIZE; i++)
+        if (!g_ticket_cache[i].valid) return &g_ticket_cache[i];
+    return &g_ticket_cache[0]; /* evict slot 0 if full */
+}
+
+/* Parse a TLS 1.3 NewSessionTicket handshake message (type 0x04) and store a
+ * resumption PSK for the connection's host. msg points at the handshake header. */
+static void tls13_store_ticket(nanotls_conn *conn, const uint8_t *msg, int msg_len) {
+    if (!conn->resumption_ms_valid || !conn->sni_host) return;
+    if (msg_len < 4 || msg[0] != 0x14 /*HS_FINISHED? no*/) { /* type checked by caller */ }
+    /* Body layout (RFC 8446 4.6.1):
+       uint32 ticket_lifetime; uint32 ticket_age_add; opaque ticket_nonce<0..255>;
+       opaque ticket<1..2^16-1>; Extension extensions<0..2^16-2>;  */
+    int p = 4; /* skip handshake header (type + 3-byte length) */
+    if (p + 9 > msg_len) return;
+    uint32_t lifetime = (msg[p]<<24)|(msg[p+1]<<16)|(msg[p+2]<<8)|msg[p+3]; p += 4;
+    uint32_t age_add  = (msg[p]<<24)|(msg[p+1]<<16)|(msg[p+2]<<8)|msg[p+3]; p += 4;
+    int nonce_len = msg[p++];
+    if (p + nonce_len + 2 > msg_len) return;
+    const uint8_t *nonce = msg + p; p += nonce_len;
+    int ticket_len = (msg[p]<<8)|msg[p+1]; p += 2;
+    if (ticket_len < 1 || ticket_len > 2048 || p + ticket_len > msg_len) return;
+    const uint8_t *ticket = msg + p;
+
+    int hlen = (conn->cipher_suite == 0x1302) ? 48 : 32;
+    /* PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", nonce, L) */
+    uint8_t psk[48];
+    {
+        uint8_t info[64]; int il = 0;
+        info[il++] = (uint8_t)(hlen >> 8); info[il++] = (uint8_t)(hlen & 0xFF);
+        const char *lbl = "tls13 resumption";
+        info[il++] = (uint8_t)strlen(lbl);
+        memcpy(info + il, lbl, strlen(lbl)); il += (int)strlen(lbl);
+        info[il++] = (uint8_t)nonce_len;
+        if (nonce_len) { memcpy(info + il, nonce, nonce_len); il += nonce_len; }
+        if (conn->cipher_suite == 0x1302)
+            hkdf_sha384_expand(conn->resumption_master_secret, info, il, psk, hlen);
+        else
+            hkdf_sha256_expand(conn->resumption_master_secret, info, il, psk, hlen);
+    }
+
+    tls_session_ticket *slot = ticket_slot(conn->sni_host);
+    memset(slot, 0, sizeof(*slot));
+    strncpy(slot->host, conn->sni_host, sizeof(slot->host) - 1);
+    slot->cipher_suite   = conn->cipher_suite;
+    slot->psk_len        = hlen;
+    memcpy(slot->psk, psk, hlen);
+    memcpy(slot->ticket, ticket, ticket_len);
+    slot->ticket_len     = ticket_len;
+    slot->ticket_age_add = age_add;
+    slot->ticket_lifetime = lifetime;
+    slot->obtained_ms    = now_ms();
+    slot->valid          = 1;
+#ifdef DEBUG
+    debug("[nanotls] Stored session ticket for %s (%d-byte ticket, PSK %d bytes)\n",
+          conn->sni_host, ticket_len, hlen);
+#endif
+}
+
+
 #define HS_CLIENT_HELLO      0x01
 #define HS_SERVER_HELLO      0x02
 #define HS_ENCRYPTED_EXT     0x08
@@ -183,6 +262,16 @@ static int read_full(int fd, uint8_t *buf, int len) {
     return total;
 }
 
+static int write_full(int fd, const uint8_t *buf, int len) {
+    int total = 0;
+    while (total < len) {
+        int n = write(fd, buf + total, len - total);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return total;
+}
+
 void tls13_xor_iv(uint8_t *iv, uint64_t seq, uint8_t *out) {
     memcpy(out, iv, 12);
     for (int i = 0; i < 8; i++) {
@@ -190,7 +279,13 @@ void tls13_xor_iv(uint8_t *iv, uint64_t seq, uint8_t *out) {
     }
 }
 
+int tls13_chrome_client_hello_psk(uint8_t *ch, const char *host, const uint8_t *pub_key, const uint8_t *pk_pq, const char *alpn_str, int alpn_len, const tls_session_ticket *psk, int *binder_pos_out);
+
 int tls13_chrome_client_hello_tcp(uint8_t *ch, const char *host, const uint8_t *pub_key, const uint8_t *pk_pq, const char *alpn_str, int alpn_len) {
+    return tls13_chrome_client_hello_psk(ch, host, pub_key, pk_pq, alpn_str, alpn_len, NULL, NULL);
+}
+
+int tls13_chrome_client_hello_psk(uint8_t *ch, const char *host, const uint8_t *pub_key, const uint8_t *pk_pq, const char *alpn_str, int alpn_len, const tls_session_ticket *psk, int *binder_pos_out) {
     int off = 0;
     ch[off++] = 0x01; // ClientHello
     int len_pos = off; off += 3;
@@ -201,7 +296,7 @@ int tls13_chrome_client_hello_tcp(uint8_t *ch, const char *host, const uint8_t *
     ch[off++] = 32; // Length
     bot_prng_generate_block(ch + off, 32); off += 32;
     
-    // Cipher Suites (advertised in preference order: AES-128, AES-256, ChaCha20, ECDHE ciphers)
+    // Cipher Suites — Chrome (BoringSSL) order
     int cs_len_pos = off; off += 2;
     int cs_len = 0;
     if (current_proto_tls13) {
@@ -211,9 +306,19 @@ int tls13_chrome_client_hello_tcp(uint8_t *ch, const char *host, const uint8_t *
         cs_len += 6;
     }
     if (current_proto_tls12) {
-        ch[off++] = 0xC0; ch[off++] = 0x2F; // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-        ch[off++] = 0xC0; ch[off++] = 0x2B; // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-        cs_len += 4;
+        ch[off++] = 0xC0; ch[off++] = 0x2B; // ECDHE_ECDSA_AES128_GCM_SHA256
+        ch[off++] = 0xC0; ch[off++] = 0x2F; // ECDHE_RSA_AES128_GCM_SHA256
+        ch[off++] = 0xC0; ch[off++] = 0x2C; // ECDHE_ECDSA_AES256_GCM_SHA384
+        ch[off++] = 0xC0; ch[off++] = 0x30; // ECDHE_RSA_AES256_GCM_SHA384
+        ch[off++] = 0xCC; ch[off++] = 0xA9; // ECDHE_ECDSA_CHACHA20_POLY1305
+        ch[off++] = 0xCC; ch[off++] = 0xA8; // ECDHE_RSA_CHACHA20_POLY1305
+        ch[off++] = 0xC0; ch[off++] = 0x13; // ECDHE_RSA_AES128_CBC_SHA
+        ch[off++] = 0xC0; ch[off++] = 0x14; // ECDHE_RSA_AES256_CBC_SHA
+        ch[off++] = 0x00; ch[off++] = 0x9C; // RSA_AES128_GCM_SHA256
+        ch[off++] = 0x00; ch[off++] = 0x9D; // RSA_AES256_GCM_SHA384
+        ch[off++] = 0x00; ch[off++] = 0x2F; // RSA_AES128_CBC_SHA
+        ch[off++] = 0x00; ch[off++] = 0x35; // RSA_AES256_CBC_SHA
+        cs_len += 24;
     }
     ch[cs_len_pos] = (uint8_t)(cs_len >> 8);
     ch[cs_len_pos + 1] = (uint8_t)(cs_len & 0xFF);
@@ -240,7 +345,13 @@ int tls13_chrome_client_hello_tcp(uint8_t *ch, const char *host, const uint8_t *
     ch[off++] = 0x00; ch[off++] = (uint8_t)(alpn_len + 2);
     ch[off++] = 0x00; ch[off++] = (uint8_t)alpn_len;
     memcpy(ch + off, alpn_str, alpn_len); off += alpn_len;
- 
+
+    // 4b. application_settings — ALPS (17613 = 0x44cd), advertises "h2"
+    ch[off++] = 0x44; ch[off++] = 0xcd;
+    ch[off++] = 0x00; ch[off++] = 0x05; // ext len
+    ch[off++] = 0x00; ch[off++] = 0x03; // ALPN list len
+    ch[off++] = 0x02; ch[off++] = 'h'; ch[off++] = '2';
+
     // 5. supported_groups (10 = 0x000a)
     ch[off++] = 0x00; ch[off++] = 0x0a;
     ch[off++] = 0x00; ch[off++] = 12; // Length
@@ -260,14 +371,14 @@ int tls13_chrome_client_hello_tcp(uint8_t *ch, const char *host, const uint8_t *
     ch[off++] = 0x00; ch[off++] = 0x33;
     ch[off++] = 0x04; ch[off++] = 0xea; // Extension Length = 1258 bytes
     ch[off++] = 0x04; ch[off++] = 0xe8; // List length = 1256 bytes
-    // Entry 1: X25519MLKEM768 (0x11ec)
+    // Entry 1: X25519MLKEM768 (0x11ec) — FIPS 203 via PQClean
     ch[off++] = 0x11; ch[off++] = 0xec;
     ch[off++] = 0x04; ch[off++] = 0xc0; // Key length = 1216 bytes
     memcpy(ch + off, pk_pq, 1184); off += 1184;
     memcpy(ch + off, pub_key, 32); off += 32;
-    // Entry 2: X25519 (0x001d)
+    // Entry 2: X25519 (0x001d) — fallback
     ch[off++] = 0x00; ch[off++] = 0x1d;
-    ch[off++] = 0x00; ch[off++] = 32; // Key length = 32 bytes
+    ch[off++] = 0x00; ch[off++] = 32;
     memcpy(ch + off, pub_key, 32); off += 32;
  
     // 8. server_name (0 = 0x0000)
@@ -345,13 +456,38 @@ int tls13_chrome_client_hello_tcp(uint8_t *ch, const char *host, const uint8_t *
     ch[off++] = 0x2a; ch[off++] = 0x2a;
     ch[off++] = 0x00; ch[off++] = 0x00;
 
-    // 17. Padding (0x0015)
+    // 18. Padding (0x0015) — omitted when resuming (PSK must be last)
     int pad_target = 512;
-    if (off < pad_target) {
+    if (!psk && off < pad_target) {
         ch[off++] = 0x00; ch[off++] = 0x15;
         int pad_len = pad_target - off - 2;
         ch[off++] = (pad_len >> 8) & 0xFF; ch[off++] = pad_len & 0xFF;
         memset(ch + off, 0, pad_len); off += pad_len;
+    }
+
+    // 19. pre_shared_key (41 = 0x0029) — MUST be the final extension.
+    // Layout: ext_type(2) ext_len(2) | identities_len(2) [ticket_len(2) ticket age(4)]
+    //         | binders_len(2) [binder_len(1) binder(hash_len)]
+    if (psk) {
+        int hash_len = psk->psk_len;          /* 32 or 48 */
+        uint32_t age = (uint32_t)(now_ms() - psk->obtained_ms) + psk->ticket_age_add;
+        int identities_len = 2 + psk->ticket_len + 4;    /* len(2)+ticket+age(4) */
+        int binders_len    = 1 + hash_len;               /* len(1)+binder */
+        int ext_len = 2 + identities_len + 2 + binders_len;
+
+        ch[off++] = 0x00; ch[off++] = 0x29;
+        ch[off++] = (uint8_t)(ext_len >> 8); ch[off++] = (uint8_t)(ext_len & 0xFF);
+        /* identities */
+        ch[off++] = (uint8_t)(identities_len >> 8); ch[off++] = (uint8_t)(identities_len & 0xFF);
+        ch[off++] = (uint8_t)(psk->ticket_len >> 8); ch[off++] = (uint8_t)(psk->ticket_len & 0xFF);
+        memcpy(ch + off, psk->ticket, psk->ticket_len); off += psk->ticket_len;
+        ch[off++] = (uint8_t)(age >> 24); ch[off++] = (uint8_t)(age >> 16);
+        ch[off++] = (uint8_t)(age >> 8);  ch[off++] = (uint8_t)(age & 0xFF);
+        /* binders */
+        ch[off++] = (uint8_t)(binders_len >> 8); ch[off++] = (uint8_t)(binders_len & 0xFF);
+        ch[off++] = (uint8_t)hash_len;
+        if (binder_pos_out) *binder_pos_out = off;   /* caller fills hash_len bytes here */
+        memset(ch + off, 0, hash_len); off += hash_len;
     }
 
     int ext_len = off - ext_len_pos - 2;
@@ -377,7 +513,8 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
     mlkem768_keygen(pk_pq, sk_pq, coins);
 
     const char *sni_host = host;
-    conn->alpn_str = current_alpn;
+    memcpy(conn->alpn_buf, current_alpn, current_alpn_len + 1);
+    conn->alpn_str = conn->alpn_buf;
     conn->alpn_len = current_alpn_len;
     conn->is_h2 = current_mode_h2;
 
@@ -403,24 +540,74 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
 
     uint8_t ch[4096];
     ch[0] = 0x16; ch[1] = 0x03; ch[2] = 0x01; // Record Header
-    
-    int hs_len = tls13_chrome_client_hello_tcp(ch + 5, sni_host, pub, pk_pq, alpn_str, alpn_len);
+
+    /* Look up a cached session ticket for PSK resumption (TLS 1.3 only) */
+    tls_session_ticket *psk = NULL;
+    if (current_proto_tls13) {
+        tls_session_ticket *t = ticket_find(host);
+        if (t && t->valid && t->ticket_len > 0) {
+            /* honor ticket lifetime (seconds) if provided */
+            if (t->ticket_lifetime == 0 ||
+                (now_ms() - t->obtained_ms) / 1000ULL < t->ticket_lifetime) {
+                psk = t;
+            }
+        }
+    }
+
+    int binder_pos = -1;
+    int hs_len = tls13_chrome_client_hello_psk(ch + 5, sni_host, pub, pk_pq,
+                                               alpn_str, alpn_len, psk, &binder_pos);
     ch[3] = (hs_len >> 8) & 0xFF;
     ch[4] = hs_len & 0xFF;
-    
+
     int off = 5 + hs_len;
     memcpy(conn->client_random, ch + 11, 32);
 
+    /* If resuming, compute and patch the PSK binder over the truncated CH */
+    if (psk && binder_pos > 0) {
+        int hlen = psk->psk_len;
+        uint16_t cs = psk->cipher_suite;
+        /* truncated transcript = CH handshake body minus binders(2)+blen(1)+binder */
+        int trunc_len = binder_pos - 3;   /* binder_pos is at start of binder bytes */
+        uint8_t th[48];
+        if (cs == 0x1302) {
+            sha384_ctx_t tx; sha384_init(&tx);
+            sha384_update(&tx, ch + 5, trunc_len);
+            sha384_final(&tx, th);
+        } else {
+            sha256_ctx_t tx; sha256_init(&tx);
+            sha256_update(&tx, ch + 5, trunc_len);
+            sha256_final(&tx, th);
+        }
+        /* binder_key = Derive-Secret(early_secret, "res binder", "") */
+        uint8_t es[48], binder_key[48], fin_key[48], binder[48];
+        const uint8_t eh32[32] = {
+            0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24,
+            0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c,0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55 };
+        const uint8_t eh48[48] = {
+            0x38,0xb0,0x60,0xa7,0x51,0xac,0x96,0x38,0x4c,0xd9,0x32,0x7e,0xb1,0xb1,0xe3,0x6a,
+            0x21,0xfd,0xb7,0x11,0x14,0xbe,0x07,0x43,0x4c,0x0c,0xc7,0xbf,0x63,0xf6,0xe1,0xda,
+            0x27,0x4e,0xde,0xbf,0xe7,0x6f,0x65,0xfb,0xd5,0x1a,0xd2,0xf1,0x48,0x98,0xb9,0x5b };
+        const uint8_t *eh = (cs == 0x1302) ? eh48 : eh32;
+        if (cs == 0x1302) hkdf_sha384_extract(NULL, 0, psk->psk, hlen, es);
+        else              hkdf_sha256_extract(NULL, 0, psk->psk, hlen, es);
+        tls13_derive_secret_cs(cs, es, "res binder", eh, hlen, binder_key);
+        tls13_expand_label_cs(cs, binder_key, "finished", NULL, 0, fin_key, hlen);
+        if (cs == 0x1302) hmac_sha384(fin_key, hlen, th, hlen, binder);
+        else              hmac_sha256(fin_key, hlen, th, hlen, binder);
+        memcpy(ch + 5 + binder_pos, binder, hlen);
+    }
+
     sha256_update(&conn->transcript_ctx, ch + 5, hs_len);
     sha384_update(&conn->transcript_ctx_384, ch + 5, hs_len);
-    write(conn->fd, ch, off);  
+    if (write_full(conn->fd, ch, off) < 0) return -1;
 
     uint8_t early_secret[48], handshake_secret[48], transcript_hash[48];
     uint8_t c_hs_secret[48], s_hs_secret[48];
     static const uint8_t empty_hash[48] = {
-        0x38,0xb0,0x60,0xa7,0x51,0xac,0x96,0x38,0x4c,0xd7,0x7a,0x7e,0x9b,0x4a,0x5a,0xc6,
-        0x15,0x5c,0x17,0x6f,0x17,0xee,0xcb,0x3b,0xcd,0x9b,0xef,0x01,0x5b,0x1d,0xa0,0x02,
-        0x33,0x3b,0x3e,0xcd,0x5a,0xd9,0x81,0xf6,0x7b,0x6a,0xca,0xfb,0x8b,0xcf,0x58,0x6c
+        0x38,0xb0,0x60,0xa7,0x51,0xac,0x96,0x38,0x4c,0xd9,0x32,0x7e,0xb1,0xb1,0xe3,0x6a,
+        0x21,0xfd,0xb7,0x11,0x14,0xbe,0x07,0x43,0x4c,0x0c,0xc7,0xbf,0x63,0xf6,0xe1,0xda,
+        0x27,0x4e,0xde,0xbf,0xe7,0x6f,0x65,0xfb,0xd5,0x1a,0xd2,0xf1,0x48,0x98,0xb9,0x5b
     };
     static const uint8_t empty_hash_256[32] = {
         0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24,
@@ -435,6 +622,7 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
         debug("[nanotls] Handshake Recv Record: type=0x%02x, len=%d\n", head[0], rlen);
 #endif
         uint8_t *rec = malloc(rlen);
+        if (!rec) break;
         if (read_full(conn->fd, rec, rlen) <= 0) { free(rec); break; }
 
         if (head[0] == 0x15) {
@@ -520,6 +708,7 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
 
             int ext_offset = 39 + sess_id_len + 3;
             int has_tls13_supported_versions = 0;
+            int server_psk_accepted = 0;
             uint16_t selected_group = 0;
             uint8_t *s_key_share = NULL;
             int s_key_share_len = 0;
@@ -542,6 +731,9 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                                 has_tls13_supported_versions = 1;
                             }
                         }
+                    }
+                    if (ext_type == 0x0029) { // pre_shared_key — server accepted our PSK
+                        server_psk_accepted = 1;
                     }
                     if (ext_type == 0x0033) { // key_share extension
                         if (ext_data_len >= 4) {
@@ -593,7 +785,7 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
             
             uint8_t shared[64];
             int shared_len = 32;
-            uint8_t s_priv[32]; memcpy(s_priv, priv, 32); s_priv[0]&=248; s_priv[31]&=127; s_priv[31]|=64;
+            uint8_t s_priv[32]; memcpy(s_priv, priv, 32);
 
             if (selected_group == 0x11ec) {
                 if (s_key_share_len < 1120) { free(rec); return -3; }
@@ -603,8 +795,8 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                 uint8_t cl_secret[32];
                 x25519(cl_secret, s_priv, s_key_share + 1088);
                 
-                memcpy(shared, pq_secret, 32);
-                memcpy(shared + 32, cl_secret, 32);
+                memcpy(shared, cl_secret, 32);      // X25519 first (per draft-ietf-tls-hybrid-design)
+                memcpy(shared + 32, pq_secret, 32); // ML-KEM second
                 shared_len = 64;
 #ifdef DEBUG
                 debug("[nanotls] Decapsulated hybrid PQ secret successfully!\n");
@@ -623,7 +815,10 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
 
             if (conn->cipher_suite == 0x1302) {
                 sha384_ctx_t tmp_ctx = conn->transcript_ctx_384; sha384_final(&tmp_ctx, transcript_hash);
-                hkdf_sha384_extract(NULL, 0, NULL, 0, early_secret);
+                if (server_psk_accepted && psk)
+                    hkdf_sha384_extract(NULL, 0, psk->psk, psk->psk_len, early_secret);
+                else
+                    hkdf_sha384_extract(NULL, 0, NULL, 0, early_secret);
                 tls13_derive_secret_cs(conn->cipher_suite, early_secret, "derived", eh, hash_len, derived_secret);
                 hkdf_sha384_extract(derived_secret, 48, shared, shared_len, handshake_secret);
                 tls13_derive_secret_cs(conn->cipher_suite, handshake_secret, "c hs traffic", transcript_hash, hash_len, c_hs_secret);
@@ -638,7 +833,10 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
 #endif
             } else {
                 sha256_ctx_t tmp_ctx = conn->transcript_ctx; sha256_final(&tmp_ctx, transcript_hash);
-                hkdf_sha256_extract(NULL, 0, NULL, 0, early_secret);
+                if (server_psk_accepted && psk)
+                    hkdf_sha256_extract(NULL, 0, psk->psk, psk->psk_len, early_secret);
+                else
+                    hkdf_sha256_extract(NULL, 0, NULL, 0, early_secret);
                 tls13_derive_secret_cs(conn->cipher_suite, early_secret, "derived", eh, hash_len, derived_secret);
                 hkdf_sha256_extract(derived_secret, 32, shared, shared_len, handshake_secret);
                 tls13_derive_secret_cs(conn->cipher_suite, handshake_secret, "c hs traffic", transcript_hash, hash_len, c_hs_secret);
@@ -686,7 +884,9 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                     free(dec); free(rec); return -5;
                 }
             } else {
-                chacha20_poly1305_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, dec, rec + rlen - 16);
+                if (chacha20_poly1305_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, dec, rec + rlen - 16) < 0) {
+                    free(dec); free(rec); return -5;
+                }
             }
             
             int dlen = rlen - 16;
@@ -725,8 +925,7 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                         
                         uint8_t s_priv[32];
                         memcpy(s_priv, priv, 32);
-                        s_priv[0] &= 248; s_priv[31] &= 127; s_priv[31] |= 64;
-                        
+
                         x25519(conn->handshake_secret, s_priv, s_pub);
 #ifdef DEBUG
                         debug("[nanotls] Parsed X25519 ServerKeyExchange\n");
@@ -763,6 +962,9 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                     memcpy(conn->server_key, kb + 16, 16);
                     memcpy(conn->client_iv, kb + 32, 4);
                     memcpy(conn->server_iv, kb + 36, 4);
+                    aes_128_key_expand(conn->client_key, conn->client_key_w);
+                    aes_128_key_expand(conn->server_key, conn->server_key_w);
+                    conn->ks_rounds = 10;
                     
                     uint8_t th[32];
                     sha256_ctx_t tmp_ctx = conn->transcript_ctx;
@@ -817,7 +1019,7 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                     memcpy(c_flight + c_off, f_payload, 40);
                     c_off += 40;
                     
-                    write(conn->fd, c_flight, c_off);
+                    if (write_full(conn->fd, c_flight, c_off) < 0) { free(rec); return -1; }
                 }
                 
                 int consumed = 4 + mlen;
@@ -869,9 +1071,7 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                 }
                 
                 uint8_t c_fin_key[48], verify[48];
-                uint8_t f_lab[] = {0x99, 0x96, 0x91, 0x96, 0x8C, 0x97, 0x9A, 0x9B, 0x00}; 
-                for(int i=0; f_lab[i]; i++) f_lab[i] ^= 0xFF;
-                tls13_expand_label_cs(conn->cipher_suite, c_hs_secret, (char*)f_lab, NULL, 0, c_fin_key, hash_len);
+                tls13_expand_label_cs(conn->cipher_suite, c_hs_secret, "finished", NULL, 0, c_fin_key, hash_len);
                 
                 if (conn->cipher_suite == 0x1302) {
                     hmac_sha384(c_fin_key, hash_len, th, hash_len, verify);
@@ -903,8 +1103,15 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                 }
                 enc_pkt[0]=0x17; enc_pkt[1]=0x03; enc_pkt[2]=0x03; enc_pkt[3]=(uint8_t)(clen>>8); enc_pkt[4]=(uint8_t)(clen&0xff);
                 memcpy(enc_pkt + 5 + fin_msg_len + 1, tag, 16);
-                write(conn->fd, enc_pkt, 5 + clen);
+                if (write_full(conn->fd, enc_pkt, 5 + clen) < 0) {
+                    free(enc_pkt); free(fin); free(rec); return -1;
+                }
                 free(enc_pkt);
+                /* Add client Finished to transcript (needed for resumption master secret) */
+                if (conn->cipher_suite == 0x1302)
+                    sha384_update(&conn->transcript_ctx_384, fin, fin_msg_len);
+                else
+                    sha256_update(&conn->transcript_ctx, fin, fin_msg_len);
                 free(fin);
                 
                 uint8_t derived2[48], master_secret[48];
@@ -928,6 +1135,31 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
                 tls13_expand_label_cs(conn->cipher_suite, s_ap, "key", NULL, 0, conn->server_key, app_key_len);
                 tls13_expand_label_cs(conn->cipher_suite, s_ap, "iv", NULL, 0, conn->server_iv, 12);
                 conn->client_seq = 0; conn->server_seq = 0;
+
+                /* Resumption master secret: Derive-Secret(MS, "res master",
+                   ClientHello..client Finished). Client Finished already in transcript. */
+                uint8_t th_cf[48];
+                if (conn->cipher_suite == 0x1302) {
+                    sha384_ctx_t fc = conn->transcript_ctx_384; sha384_final(&fc, th_cf);
+                } else {
+                    sha256_ctx_t fc = conn->transcript_ctx; sha256_final(&fc, th_cf);
+                }
+                tls13_derive_secret_cs(conn->cipher_suite, master_secret, "res master",
+                                       th_cf, hash_len, conn->resumption_master_secret);
+                conn->resumption_ms_valid = 1;
+
+                /* Pre-expand AES key schedules for fast send/recv */
+                if (conn->cipher_suite == 0x1301) {
+                    aes_128_key_expand(conn->client_key, conn->client_key_w);
+                    aes_128_key_expand(conn->server_key, conn->server_key_w);
+                    conn->ks_rounds = 10;
+                } else if (conn->cipher_suite == 0x1302) {
+                    aes_256_key_expand(conn->client_key, conn->client_key_w);
+                    aes_256_key_expand(conn->server_key, conn->server_key_w);
+                    conn->ks_rounds = 14;
+                } else {
+                    conn->ks_rounds = 0; /* ChaCha20 — no key schedule */
+                }
                 
                 finished_success = 1;
                 conn->hs_buf_len = 0;
@@ -948,61 +1180,16 @@ int tls13_handshake(nanotls_conn *conn, const char *host) {
     return -4;
 }
 
-static nanotls_conn global_conn;
 nanotls_conn* tls_core_connect(const char* host, int port) {
-    int orig_tls13 = current_proto_tls13;
-    int orig_tls12 = current_proto_tls12;
+    struct addrinfo hints = {0}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[8]; snprintf(port_str, sizeof(port_str), "%d", port);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) return NULL;
+    struct sockaddr_in addr = *(struct sockaddr_in *)res->ai_addr;
+    freeaddrinfo(res);
 
-    // 1. Try TLS 1.3 first if enabled
-    if (orig_tls13) {
-        current_proto_tls13 = 1;
-        current_proto_tls12 = orig_tls12;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct timeval tv;
-        tv.tv_sec = 5; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        struct sockaddr_in addr; addr.sin_family = AF_INET; addr.sin_port = htons(port); addr.sin_addr.s_addr = inet_addr(host);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) >= 0) {
-            memset(&global_conn, 0, sizeof(global_conn)); global_conn.fd = fd;
-            int res = tls13_handshake(&global_conn, host);
-            if (res >= 0) {
-                current_proto_tls13 = orig_tls13;
-                current_proto_tls12 = orig_tls12;
-                return &global_conn;
-            }
-            printf("[nanotls] TLS 1.3 handshake failed (err=%d). Falling back to TLS 1.2...\n", res);
-            close(fd);
-        } else {
-            close(fd);
-        }
-    }
-
-    // 2. Fallback: try TLS 1.2 exclusively
-    if (orig_tls12) {
-        current_proto_tls13 = 0;
-        current_proto_tls12 = 1;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct timeval tv;
-        tv.tv_sec = 5; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        struct sockaddr_in addr; addr.sin_family = AF_INET; addr.sin_port = htons(port); addr.sin_addr.s_addr = inet_addr(host);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) >= 0) {
-            memset(&global_conn, 0, sizeof(global_conn)); global_conn.fd = fd;
-            int res = tls13_handshake(&global_conn, host);
-            if (res >= 0) {
-                current_proto_tls13 = orig_tls13;
-                current_proto_tls12 = orig_tls12;
-                return &global_conn;
-            }
-            close(fd);
-        } else {
-            close(fd);
-        }
-    }
-
-    current_proto_tls13 = orig_tls13;
-    current_proto_tls12 = orig_tls12;
-    return NULL;
+    return tls_core_connect_addr(&addr, host);
 }
 
 int tls_core_send(nanotls_conn* conn, const void* data, int len) {
@@ -1029,28 +1216,26 @@ int tls_core_send(nanotls_conn* conn, const void* data, int len) {
         ad[11] = (len >> 8) & 0xff; ad[12] = len & 0xff;
         
         uint8_t tag[16];
-        aes_128_gcm_encrypt(conn->client_key, iv, ad, 13, data, len, enc + 13, tag);
-        
+        aes_gcm_encrypt_ks(conn->client_key_w, conn->ks_rounds, iv, ad, 13, data, len, enc + 13, tag);
+
         enc[0] = 0x17; enc[1] = 0x03; enc[2] = 0x03;
         enc[3] = (clen >> 8) & 0xff; enc[4] = clen & 0xff;
         memcpy(enc + 13 + len, tag, 16);
-        
+
         int ret = write(conn->fd, enc, 5 + clen);
         free(enc);
         return ret;
     }
-    
+
     uint8_t *enc = malloc(len + 64); if (!enc) return -1;
-    uint8_t tag[16], iv[12]; 
+    uint8_t tag[16], iv[12];
     uint8_t *buf = malloc(len + 1); if (!buf) { free(enc); return -1; }
     memcpy(buf, data, len); buf[len]=0x17;
     tls13_xor_iv(conn->client_iv, conn->client_seq++, iv);
     uint8_t ad[5]; ad[0]=0x17; ad[1]=0x03; ad[2]=0x03; int clen=len+1+16; ad[3]=clen>>8; ad[4]=clen&0xff;
-    
-    if (conn->cipher_suite == 0x1301) {
-        aes_128_gcm_encrypt(conn->client_key, iv, ad, 5, buf, len + 1, enc + 5, tag);
-    } else if (conn->cipher_suite == 0x1302) {
-        aes_256_gcm_encrypt(conn->client_key, iv, ad, 5, buf, len + 1, enc + 5, tag);
+
+    if (conn->ks_rounds) {
+        aes_gcm_encrypt_ks(conn->client_key_w, conn->ks_rounds, iv, ad, 5, buf, len + 1, enc + 5, tag);
     } else {
         chacha20_poly1305_encrypt(conn->client_key, iv, ad, 5, buf, len + 1, enc + 5, tag);
     }
@@ -1116,20 +1301,23 @@ int tls_core_recv(nanotls_conn* conn, void* buf, int len) {
     }
 
     if (!conn->is_h2) {
-        // HTTP/1.1 path: read a record and return it
+        // HTTP/1.1 path: read a record and return it.
+        // Loop so we transparently skip TLS 1.3 post-handshake messages
+        // (NewSessionTicket / KeyUpdate, inner content type 0x16) and CCS (0x14).
+      while (1) {
         uint8_t head[5], iv[12];
         if (read_full(conn->fd, head, 5) <= 0) return -1;
         int rlen = (head[3] << 8) | head[4];
         if (rlen <= 16 || rlen > 20000) return -1;
         uint8_t *rec = malloc(rlen); if (!rec) return -1;
         if (read_full(conn->fd, rec, rlen) <= 0) { free(rec); return -1; }
-        
+
         int dlen;
         if (conn->is_tls12) {
             if (rlen < 24) { free(rec); return -1; }
             memcpy(iv, conn->server_iv, 4);
             memcpy(iv + 4, rec, 8);
-            
+
             uint64_t seq = conn->server_seq++;
             uint8_t ad[13];
             ad[0] = (seq >> 56) & 0xff; ad[1] = (seq >> 48) & 0xff;
@@ -1140,30 +1328,44 @@ int tls_core_recv(nanotls_conn* conn, void* buf, int len) {
             ad[9] = 0x03; ad[10] = 0x03;
             dlen = rlen - 8 - 16;
             ad[11] = (dlen >> 8) & 0xff; ad[12] = dlen & 0xff;
-            
+
             int decrypt_res = aes_128_gcm_decrypt(conn->server_key, iv, ad, 13, rec + 8, dlen, buf, rec + rlen - 16);
             free(rec);
             if (decrypt_res < 0) return -1;
-            if (head[0] == 0x15) return -1;
+            // TLS 1.2: outer record type IS the content type
+            if (head[0] == 0x15) return -1;     // alert
+            if (head[0] == 0x16) continue;       // handshake (e.g. NewSessionTicket) — skip
             return dlen;
         } else {
             tls13_xor_iv(conn->server_iv, conn->server_seq++, iv);
             uint8_t ad[5]; ad[0] = head[0]; ad[1] = head[1]; ad[2] = head[2]; ad[3] = head[3]; ad[4] = head[4];
-            
-            if (conn->cipher_suite == 0x1301) {
-                aes_128_gcm_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, buf, rec + rlen - 16);
-            } else if (conn->cipher_suite == 0x1302) {
-                aes_256_gcm_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, buf, rec + rlen - 16);
+
+            int dec_res;
+            if (conn->ks_rounds) {
+                dec_res = aes_gcm_decrypt_ks(conn->server_key_w, conn->ks_rounds, iv, ad, 5, rec, rlen - 16, buf, rec + rlen - 16);
             } else {
-                chacha20_poly1305_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, buf, rec + rlen - 16);
+                dec_res = chacha20_poly1305_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, buf, rec + rlen - 16);
             }
-            
-            dlen = rlen - 16; while (dlen > 0 && ((uint8_t*)buf)[dlen-1] == 0) dlen--; if (dlen > 0) dlen--;
-            uint8_t type = ((uint8_t*)buf)[dlen];
+
             free(rec);
-            if (type == 0x15) return -1;
+            if (dec_res < 0) return -1;
+            dlen = dec_res; while (dlen > 0 && ((uint8_t*)buf)[dlen-1] == 0) dlen--; if (dlen > 0) dlen--;
+            uint8_t type = ((uint8_t*)buf)[dlen];
+            if (type == 0x15) return -1;        // alert
+            if (type == 0x16) {                  // handshake (NewSessionTicket / KeyUpdate)
+                uint8_t *m = (uint8_t*)buf; int mp = 0;
+                while (mp + 4 <= dlen) {
+                    int ml = (m[mp+1]<<16)|(m[mp+2]<<8)|m[mp+3];
+                    if (mp + 4 + ml > dlen) break;
+                    if (m[mp] == 0x04) tls13_store_ticket(conn, m + mp, 4 + ml);
+                    mp += 4 + ml;
+                }
+                continue;                        // skip, read next record
+            }
+            if (type == 0x14) continue;          // CCS — skip
             return dlen;
         }
+      }
     } else {
         // HTTP/2 path: Parse from conn->hs_buf queue
         while (1) {
@@ -1247,16 +1449,16 @@ int tls_core_recv(nanotls_conn* conn, void* buf, int len) {
             } else {
                 tls13_xor_iv(conn->server_iv, conn->server_seq++, iv);
                 uint8_t ad[5]; ad[0] = head[0]; ad[1] = head[1]; ad[2] = head[2]; ad[3] = head[3]; ad[4] = head[4];
-                
-                if (conn->cipher_suite == 0x1301) {
-                    aes_128_gcm_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, dec_buf, rec + rlen - 16);
-                } else if (conn->cipher_suite == 0x1302) {
-                    aes_256_gcm_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, dec_buf, rec + rlen - 16);
+
+                int dec_res;
+                if (conn->ks_rounds) {
+                    dec_res = aes_gcm_decrypt_ks(conn->server_key_w, conn->ks_rounds, iv, ad, 5, rec, rlen - 16, dec_buf, rec + rlen - 16);
                 } else {
-                    chacha20_poly1305_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, dec_buf, rec + rlen - 16);
+                    dec_res = chacha20_poly1305_decrypt(conn->server_key, iv, ad, 5, rec, rlen - 16, dec_buf, rec + rlen - 16);
                 }
-                
-                dlen = rlen - 16; while (dlen > 0 && dec_buf[dlen-1] == 0) dlen--; if (dlen > 0) dlen--;
+
+                if (dec_res < 0) { free(rec); free(dec_buf); return -1; }
+                dlen = dec_res; while (dlen > 0 && dec_buf[dlen-1] == 0) dlen--; if (dlen > 0) dlen--;
             }
             
             uint8_t type = conn->is_tls12 ? head[0] : dec_buf[dlen];
@@ -1271,7 +1473,17 @@ int tls_core_recv(nanotls_conn* conn, void* buf, int len) {
                 free(dec_buf);
                 return -1;
             }
-            
+
+            if (type == 0x16 && !conn->is_tls12) { // post-handshake (NewSessionTicket)
+                uint8_t *m = dec_buf; int mp = 0;
+                while (mp + 4 <= dlen) {
+                    int ml = (m[mp+1]<<16)|(m[mp+2]<<8)|m[mp+3];
+                    if (mp + 4 + ml > dlen) break;
+                    if (m[mp] == 0x04) tls13_store_ticket(conn, m + mp, 4 + ml);
+                    mp += 4 + ml;
+                }
+            }
+
             if (type == 0x17) {
                 // Append decrypted record data to connection buffer queue
                 if (conn->hs_buf_len + dlen <= (int)sizeof(conn->hs_buf)) {
@@ -1336,8 +1548,10 @@ static int extract_crypto_frames(const uint8_t *plain, int plain_len,
             off += len;
             continue;
         }
-        off = quic_skip_frame(plain - vl, plain_len);
-        if (off < 0) break;
+        off -= vl;
+        int skipped = quic_skip_frame(plain + off, plain_len - off);
+        if (skipped <= 0) break;
+        off += skipped;
     }
     return written;
 }
@@ -1357,23 +1571,26 @@ static void *nanotls_try_quic(struct sockaddr_in* addr, const char* host) {
                                     conn->scid, conn->scid_len,
                                     conn->pub_key);
 
-    sha256_ctx_t transcript;
-    sha256_init(&transcript);
-    sha256_update(&transcript, ch_buf, ch_len);
+    sha256_ctx_t transcript256;
+    sha384_ctx_t transcript384;
+    sha256_init(&transcript256);
+    sha384_init(&transcript384);
+    sha256_update(&transcript256, ch_buf, ch_len);
+    sha384_update(&transcript384, ch_buf, ch_len);
 
     quic_send_initial(conn, host, ch_buf, ch_len, NULL, 0);
 
     uint8_t server_pub[32];
     uint8_t shared[32];
-    uint8_t c_hs_key[16], c_hs_iv[12], c_hs_hp[16];
-    uint8_t s_hs_key[16], s_hs_iv[12], s_hs_hp[16];
+    uint8_t c_hs_key[32], c_hs_iv[12], c_hs_hp[32];
+    uint8_t s_hs_key[32], s_hs_iv[12], s_hs_hp[32];
 
     int sh_done     = 0;
     int hs_done     = 0;
     int retry_count = 0;
 
     uint8_t pkt[4096], plain[4096];
-    static uint8_t crypto_data[16384];
+    uint8_t crypto_data[16384];
     int crypto_fill = 0;
     struct sockaddr_in from;
     socklen_t fromlen;
@@ -1405,12 +1622,13 @@ static void *nanotls_try_quic(struct sockaddr_in* addr, const char* host) {
             uint8_t token[256]; int tlen = 0;
             if (quic_parse_retry(pkt, n, conn->dcid, &conn->dcid_len,
                                  token, &tlen) == 0) {
-                sha256_init(&transcript);
+                sha256_init(&transcript256); sha384_init(&transcript384);
                 ch_len = tls13_client_hello(ch_buf, host,
                                             conn->dcid, conn->dcid_len,
                                             conn->scid, conn->scid_len,
                                             conn->pub_key);
-                sha256_update(&transcript, ch_buf, ch_len);
+                sha256_update(&transcript256, ch_buf, ch_len);
+                sha384_update(&transcript384, ch_buf, ch_len);
                 conn->c_initial_pn = 1;
                 quic_send_initial(conn, host, ch_buf, ch_len, token, tlen);
             }
@@ -1431,18 +1649,26 @@ static void *nanotls_try_quic(struct sockaddr_in* addr, const char* host) {
             int msglen = 0;
             const uint8_t *sh = find_hs_msg(crypto_data, crypto_len, 0x02, &msglen);
             if (sh && !sh_done) {
-                if (!quic_parse_server_hello(sh, msglen, server_pub)) {
+                if (!quic_parse_server_hello(sh, msglen, server_pub, &conn->cipher_suite)) {
                     quic_close(conn);
                     return NULL;
                 }
                 x25519(shared, conn->priv_key, server_pub);
-                sha256_update(&transcript, sh, msglen);
-                sha256_ctx_t tmp = transcript;
-                uint8_t th[32]; sha256_final(&tmp, th);
-
-                quic_derive_handshake_secrets(conn, shared, th,
-                                             c_hs_key, c_hs_iv, c_hs_hp,
-                                             s_hs_key, s_hs_iv, s_hs_hp);
+                if (conn->cipher_suite == 0x1302) {
+                    sha384_update(&transcript384, sh, msglen);
+                    sha384_ctx_t tmp = transcript384;
+                    uint8_t th[48]; sha384_final(&tmp, th);
+                    quic_derive_handshake_secrets(conn, shared, th,
+                                                 c_hs_key, c_hs_iv, c_hs_hp,
+                                                 s_hs_key, s_hs_iv, s_hs_hp);
+                } else {
+                    sha256_update(&transcript256, sh, msglen);
+                    sha256_ctx_t tmp = transcript256;
+                    uint8_t th[32]; sha256_final(&tmp, th);
+                    quic_derive_handshake_secrets(conn, shared, th,
+                                                 c_hs_key, c_hs_iv, c_hs_hp,
+                                                 s_hs_key, s_hs_iv, s_hs_hp);
+                }
                 sh_done = 1;
             }
             send_initial_ack(conn);
@@ -1470,14 +1696,24 @@ static void *nanotls_try_quic(struct sockaddr_in* addr, const char* host) {
                 if (parsed + total > crypto_fill) break;
 
                 if (mtype != 0x14) {
-                    sha256_update(&transcript, crypto_data + parsed, total);
+                    if (conn->cipher_suite == 0x1302)
+                        sha384_update(&transcript384, crypto_data + parsed, total);
+                    else
+                        sha256_update(&transcript256, crypto_data + parsed, total);
                 }
 
                 if (mtype == 0x14) {
-                    sha256_update(&transcript, crypto_data + parsed, total);
-                    uint8_t th[32]; sha256_final(&transcript, th);
-                    quic_derive_application_secrets(conn, th);
-                    quic_send_finished(conn, th, c_hs_key, c_hs_iv, c_hs_hp);
+                    if (conn->cipher_suite == 0x1302) {
+                        sha384_update(&transcript384, crypto_data + parsed, total);
+                        uint8_t th[48]; sha384_final(&transcript384, th);
+                        quic_derive_application_secrets(conn, th);
+                        quic_send_finished(conn, th, c_hs_key, c_hs_iv, c_hs_hp);
+                    } else {
+                        sha256_update(&transcript256, crypto_data + parsed, total);
+                        uint8_t th[32]; sha256_final(&transcript256, th);
+                        quic_derive_application_secrets(conn, th);
+                        quic_send_finished(conn, th, c_hs_key, c_hs_iv, c_hs_hp);
+                    }
                     hs_done = 1;
                 }
                 parsed += total;
@@ -1502,6 +1738,7 @@ static void *nanotls_try_quic(struct sockaddr_in* addr, const char* host) {
 }
 
 void tls_core_close(nanotls_conn* conn) {
+    if (!conn) return;
     if (conn->is_quic) {
         if (conn->quic_conn_ptr) {
             quic_close((quic_conn *)conn->quic_conn_ptr);
@@ -1509,36 +1746,53 @@ void tls_core_close(nanotls_conn* conn) {
     } else {
         close(conn->fd);
     }
+    free(conn);
 }
 
 int tls_core_init(void) { return 0; }
 void tls_core_cleanup(void) {}
 
+static nanotls_conn *tcp_try_connect(struct sockaddr_in *addr, const char *host) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (connect(fd, (struct sockaddr *)addr, sizeof(*addr)) < 0) { close(fd); return NULL; }
+    nanotls_conn *conn = malloc(sizeof(nanotls_conn));
+    if (!conn) { close(fd); return NULL; }
+    memset(conn, 0, sizeof(nanotls_conn)); conn->fd = fd;
+    if (tls13_handshake(conn, host) < 0) { free(conn); close(fd); return NULL; }
+    return conn;
+}
+
 nanotls_conn* tls_core_connect_addr(struct sockaddr_in* addr, const char* host) {
     int orig_tls13 = current_proto_tls13;
     int orig_tls12 = current_proto_tls12;
-
-    // 1. Try HTTP/3 over QUIC first if enabled
-    if (current_proto_quic) {
-        void *qconn = nanotls_try_quic(addr, host);
-        if (qconn) {
-            memset(&global_conn, 0, sizeof(global_conn));
-            global_conn.is_quic = 1;
-            global_conn.quic_conn_ptr = qconn;
-            global_conn.sni_host = host;
-            global_conn.fd = ((quic_conn *)qconn)->fd;
-            return &global_conn;
-        }
-        printf("[nanotls] HTTP/3 over QUIC failed or was rejected. Falling back to HTTP/2...\n\n");
-    }
-
-    // Backup current ALPN mode
     char orig_alpn[32];
     int orig_alpn_len = current_alpn_len;
     int orig_mode_h2 = current_mode_h2;
     memcpy(orig_alpn, current_alpn, 32);
 
-    // 2. Try HTTP/2 over TCP/TLS first if h2 mode is allowed/configured
+#define RESTORE_CONFIG() do { \
+    current_proto_tls13 = orig_tls13; current_proto_tls12 = orig_tls12; \
+    current_alpn_len = orig_alpn_len; current_mode_h2 = orig_mode_h2; \
+    memcpy(current_alpn, orig_alpn, 32); } while(0)
+
+    // 1. Try HTTP/3 over QUIC first if enabled
+    if (current_proto_quic) {
+        void *qconn = nanotls_try_quic(addr, host);
+        if (qconn) {
+            nanotls_conn *conn = malloc(sizeof(nanotls_conn));
+            if (!conn) { quic_close((quic_conn *)qconn); RESTORE_CONFIG(); return NULL; }
+            memset(conn, 0, sizeof(nanotls_conn));
+            conn->is_quic = 1; conn->quic_conn_ptr = qconn;
+            conn->sni_host = host; conn->fd = ((quic_conn *)qconn)->fd;
+            RESTORE_CONFIG(); return conn;
+        }
+        printf("[nanotls] HTTP/3 over QUIC failed or was rejected. Falling back to HTTP/2...\n\n");
+    }
+
+    // 2. Try HTTP/2 over TCP/TLS if h2 mode configured
     if (orig_mode_h2) {
         current_alpn_len = 0;
         current_alpn[current_alpn_len++] = 2;
@@ -1546,120 +1800,45 @@ nanotls_conn* tls_core_connect_addr(struct sockaddr_in* addr, const char* host) 
         current_alpn[current_alpn_len++] = '2';
         current_alpn[current_alpn_len] = '\0';
         current_mode_h2 = 1;
-
         printf("[nanotls] Attempting HTTP/2 over TCP/TLS to %s...\n", host);
 
-        // Try TLS 1.3 first
         if (orig_tls13) {
-            current_proto_tls13 = 1;
-            current_proto_tls12 = orig_tls12;
-            int fd = socket(AF_INET, SOCK_STREAM, 0);
-            struct timeval tv;
-            tv.tv_sec = 5; tv.tv_usec = 0;
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            if (connect(fd, (struct sockaddr *)addr, sizeof(*addr)) >= 0) {
-                memset(&global_conn, 0, sizeof(global_conn)); global_conn.fd = fd;
-                int res = tls13_handshake(&global_conn, host);
-                if (res >= 0 && global_conn.is_h2) {
-                    current_proto_tls13 = orig_tls13;
-                    current_proto_tls12 = orig_tls12;
-                    current_alpn_len = orig_alpn_len;
-                    current_mode_h2 = orig_mode_h2;
-                    memcpy(current_alpn, orig_alpn, 32);
-                    return &global_conn;
-                }
-                close(fd);
-            }
+            current_proto_tls13 = 1; current_proto_tls12 = orig_tls12;
+            nanotls_conn *conn = tcp_try_connect(addr, host);
+            if (conn && conn->is_h2) { RESTORE_CONFIG(); return conn; }
+            if (conn) { close(conn->fd); free(conn); }
         }
-
-        // Try TLS 1.2 fallback
         if (orig_tls12) {
-            current_proto_tls13 = 0;
-            current_proto_tls12 = 1;
-            int fd = socket(AF_INET, SOCK_STREAM, 0);
-            struct timeval tv;
-            tv.tv_sec = 5; tv.tv_usec = 0;
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            if (connect(fd, (struct sockaddr *)addr, sizeof(*addr)) >= 0) {
-                memset(&global_conn, 0, sizeof(global_conn)); global_conn.fd = fd;
-                int res = tls13_handshake(&global_conn, host);
-                if (res >= 0 && global_conn.is_h2) {
-                    current_proto_tls13 = orig_tls13;
-                    current_proto_tls12 = orig_tls12;
-                    current_alpn_len = orig_alpn_len;
-                    current_mode_h2 = orig_mode_h2;
-                    memcpy(current_alpn, orig_alpn, 32);
-                    return &global_conn;
-                }
-                close(fd);
-            }
+            current_proto_tls13 = 0; current_proto_tls12 = 1;
+            nanotls_conn *conn = tcp_try_connect(addr, host);
+            if (conn && conn->is_h2) { RESTORE_CONFIG(); return conn; }
+            if (conn) { close(conn->fd); free(conn); }
         }
-
         printf("[nanotls] HTTP/2 over TCP/TLS failed or was rejected. Falling back to HTTP/1.1...\n\n");
     }
 
-    // 3. Fallback: Try HTTP/1.1 exclusively
+    // 3. Fallback: Try HTTP/1.1
     current_alpn_len = 0;
     current_alpn[current_alpn_len++] = 8;
     memcpy(current_alpn + current_alpn_len, "http/1.1", 8);
     current_alpn_len += 8;
     current_alpn[current_alpn_len] = '\0';
     current_mode_h2 = 0;
-
     printf("[nanotls] Attempting HTTP/1.1 over TCP/TLS to %s...\n", host);
 
-    // Try TLS 1.3 first
     if (orig_tls13) {
-        current_proto_tls13 = 1;
-        current_proto_tls12 = orig_tls12;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct timeval tv;
-        tv.tv_sec = 5; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (connect(fd, (struct sockaddr *)addr, sizeof(*addr)) >= 0) {
-            memset(&global_conn, 0, sizeof(global_conn)); global_conn.fd = fd;
-            int res = tls13_handshake(&global_conn, host);
-            if (res >= 0) {
-                current_proto_tls13 = orig_tls13;
-                current_proto_tls12 = orig_tls12;
-                current_alpn_len = orig_alpn_len;
-                current_mode_h2 = orig_mode_h2;
-                memcpy(current_alpn, orig_alpn, 32);
-                return &global_conn;
-            }
-            close(fd);
-        }
+        current_proto_tls13 = 1; current_proto_tls12 = orig_tls12;
+        nanotls_conn *conn = tcp_try_connect(addr, host);
+        if (conn) { RESTORE_CONFIG(); return conn; }
     }
-
-    // Try TLS 1.2 fallback
     if (orig_tls12) {
-        current_proto_tls13 = 0;
-        current_proto_tls12 = 1;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        struct timeval tv;
-        tv.tv_sec = 5; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        if (connect(fd, (struct sockaddr *)addr, sizeof(*addr)) >= 0) {
-            memset(&global_conn, 0, sizeof(global_conn)); global_conn.fd = fd;
-            int res = tls13_handshake(&global_conn, host);
-            if (res >= 0) {
-                current_proto_tls13 = orig_tls13;
-                current_proto_tls12 = orig_tls12;
-                current_alpn_len = orig_alpn_len;
-                current_mode_h2 = orig_mode_h2;
-                memcpy(current_alpn, orig_alpn, 32);
-                return &global_conn;
-            }
-            close(fd);
-        }
+        current_proto_tls13 = 0; current_proto_tls12 = 1;
+        nanotls_conn *conn = tcp_try_connect(addr, host);
+        if (conn) { RESTORE_CONFIG(); return conn; }
     }
 
-    // Restore original ALPN and configuration on total failure
-    current_proto_tls13 = orig_tls13;
-    current_proto_tls12 = orig_tls12;
-    current_alpn_len = orig_alpn_len;
-    current_mode_h2 = orig_mode_h2;
-    memcpy(current_alpn, orig_alpn, 32);
+    RESTORE_CONFIG();
+#undef RESTORE_CONFIG
     return NULL;
 }
 
@@ -1775,7 +1954,9 @@ int tls_send_request(nanotls_conn *conn, const char *method, const char *path) {
 
     if (!conn->is_h2) {
         char buf[8192];
-        int len = sprintf(buf, "%s %s HTTP/1.1\r\n", method, path);
+        int rem = (int)sizeof(buf);
+        int len = snprintf(buf, rem, "%s %s HTTP/1.1\r\n", method, path);
+        if (len < 0 || len >= rem) return -1;
         int has_host = 0;
         for (int i = 0; i < conn->headers_count; i++) {
             int is_host = 1;
@@ -1786,12 +1967,17 @@ int tls_send_request(nanotls_conn *conn, const char *method, const char *path) {
                 if (c1 != c2) { is_host = 0; break; }
             }
             if (is_host) has_host = 1;
-            len += sprintf(buf + len, "%s: %s\r\n", conn->headers[i].name, conn->headers[i].value);
+            int n = snprintf(buf + len, rem - len, "%s: %s\r\n", conn->headers[i].name, conn->headers[i].value);
+            if (n < 0 || n >= rem - len) return -1;
+            len += n;
         }
         if (!has_host && conn->sni_host) {
-            len += sprintf(buf + len, "Host: %s\r\n", conn->sni_host);
+            int n = snprintf(buf + len, rem - len, "Host: %s\r\n", conn->sni_host);
+            if (n < 0 || n >= rem - len) return -1;
+            len += n;
         }
-        len += sprintf(buf + len, "\r\n");
+        if (rem - len < 3) return -1;
+        len += snprintf(buf + len, rem - len, "\r\n");
         return tls_core_send(conn, buf, len);
     } else {
         uint8_t buf[8192]; int off = 0;

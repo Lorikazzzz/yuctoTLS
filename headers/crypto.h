@@ -74,17 +74,20 @@ void aes_128_ecb_encrypt(const uint8_t *key, const uint8_t *in, uint8_t *out);
 void aes_128_gcm_encrypt(const uint8_t *key, const uint8_t *iv, const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len, uint8_t *out, uint8_t *tag);
 int aes_128_gcm_decrypt(const uint8_t *key, const uint8_t *iv, const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len, uint8_t *out, const uint8_t *tag);
 
+/* Key expansion (for pre-expanding schedules into nanotls_conn) */
+void aes_128_key_expand(const uint8_t *key, uint32_t *w);
+void aes_256_key_expand(const uint8_t *key, uint32_t *w);
+
+/* Pre-expanded key schedule variants */
+void aes_gcm_encrypt_ks(const uint32_t *w, int rounds, const uint8_t *iv, const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len, uint8_t *out, uint8_t *tag);
+int  aes_gcm_decrypt_ks(const uint32_t *w, int rounds, const uint8_t *iv, const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len, uint8_t *out, const uint8_t *tag);
+
 /* AES-256 */
 void aes_256_ecb_encrypt(const uint8_t *key, const uint8_t *in, uint8_t *out);
 void aes_256_gcm_encrypt(const uint8_t *key, const uint8_t *iv, const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len, uint8_t *out, uint8_t *tag);
 int aes_256_gcm_decrypt(const uint8_t *key, const uint8_t *iv, const uint8_t *aad, size_t aad_len, const uint8_t *in, size_t len, uint8_t *out, const uint8_t *tag);
 
-/* SHA-3 / SHAKE / ML-KEM-768 */
-void shake128(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen);
-void shake256(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen);
-void sha3_256(const uint8_t *in, size_t inlen, uint8_t *out);
-void sha3_512(const uint8_t *in, size_t inlen, uint8_t *out);
-
+/* SHA-3 / ML-KEM-768 */
 void mlkem768_keygen(uint8_t pk[1184], uint8_t sk[2400], const uint8_t coins[32]);
 int mlkem768_decaps(uint8_t ss[32], const uint8_t ct[1088], const uint8_t sk[2400]);
 

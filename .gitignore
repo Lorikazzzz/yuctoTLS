@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.so.*
+
+# Test binaries
+test_h2
+test_quic
+test_tcp
+stress
+
+# Editor / OS
+*.swp
+*~
+.DS_Store

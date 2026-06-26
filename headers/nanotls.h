@@ -2,7 +2,6 @@
 #define NANOTLS_H
 
 #include "includes.h"
-#include "nanotls.h"
 #include "crypto.h"
 
 #ifdef __cplusplus
@@ -42,6 +41,9 @@ typedef struct nanotls_conn {
     uint8_t client_random[32];
     uint8_t server_random[32];
 
+    uint8_t resumption_master_secret[48];  /* TLS 1.3 RMS for ticket resumption */
+    int resumption_ms_valid;
+
     tls_http_header headers[32];
     int headers_count;
     int is_h2;
@@ -50,7 +52,11 @@ typedef struct nanotls_conn {
     uint16_t cipher_suite;
     const char *alpn_str;
     int alpn_len;
+    char alpn_buf[32];
     const char *sni_host;
+    uint32_t client_key_w[60];  /* pre-expanded AES key schedule */
+    uint32_t server_key_w[60];
+    int ks_rounds;              /* 10=AES-128, 14=AES-256, 0=ChaCha20 */
     uint8_t hs_buf[131072];
     int hs_buf_len;
     
@@ -61,6 +67,21 @@ typedef struct nanotls_conn {
 
 void tls_clear_headers(nanotls_conn *conn);
 void tls_add_header(nanotls_conn *conn, const char *name, const char *value);
+
+/* TLS 1.3 session resumption (PSK) — per-host ticket cache */
+typedef struct {
+    int valid;
+    char host[256];
+    uint16_t cipher_suite;
+    uint8_t  psk[48];              /* resumption PSK derived from RMS + ticket nonce */
+    int      psk_len;              /* 32 (SHA256) or 48 (SHA384) */
+    uint8_t  ticket[2048];
+    int      ticket_len;
+    uint32_t ticket_age_add;       /* from NewSessionTicket */
+    uint32_t ticket_lifetime;
+    uint64_t obtained_ms;          /* wallclock when stored, for obfuscated age */
+} tls_session_ticket;
+
 int tls_send_request(nanotls_conn *conn, const char *method, const char *path);
 #define _NANOTLS_NUM_ARGS(...) (sizeof((const char*[]){__VA_ARGS__})/sizeof(const char*))
 #define tls_mode(...) tls_mode_impl(_NANOTLS_NUM_ARGS(__VA_ARGS__), __VA_ARGS__)

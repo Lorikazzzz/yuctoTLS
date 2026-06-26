@@ -1,0 +1,12 @@
+The files in this directory are derived from the PQClean project:
+    https://github.com/PQClean/PQClean
+    crypto_kem/ml-kem-768/clean  and  common/
+
+PQClean's ML-KEM (Kyber) clean reference implementation is released into the
+public domain (CC0 1.0 Universal). Where individual upstream files carry a
+license header, that header is retained.
+
+Local modifications in this fork:
+  - fips202.c replaced by a compact in-tree Keccak (../keccak.c)
+  - all sources compiled as a single amalgamation via ../mlkem768.c
+  - randombytes routed to the library's getrandom()-based PRNG

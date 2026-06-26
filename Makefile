@@ -21,7 +21,7 @@ TARGET_SO_VER = $(TARGET_SO).$(VERSION)
 TARGET_SO_MAJ = $(TARGET_SO).$(VERSION_MAJOR)
 
 # Source files
-SRCS = aes.c chacha20.c crypto.c nanotls.c qpack.c quic.c prng.c
+SRCS = aes.c chacha20.c crypto.c mlkem768.c nanotls.c qpack.c quic.c prng.c
 OBJS = $(SRCS:.c=.o)
 
 # Base Compiler Flags
@@ -70,6 +70,11 @@ $(TARGET_SO_VER): $(OBJS)
 %.o: %.c
 	@printf "  \033[0;34m%-9s\033[0m %s\n" "CC" "$<"
 	@$(CC) $(CFLAGS) -c $< -o $@
+
+# mlkem768.c is a single-TU amalgamation — suppress external-code warnings
+mlkem768.o: mlkem768.c
+	@printf "  \033[0;34m%-9s\033[0m %s\n" "CC" "$<"
+	@$(CC) $(CFLAGS) -Ipqclean_mlkem -Wno-unused-parameter -Wno-sign-compare -c $< -o $@
 
 # Cleanup rule
 clean:
